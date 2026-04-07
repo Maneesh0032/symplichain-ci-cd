@@ -1,0 +1,91 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches:
+      - staging   # runs only when code is pushed to staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      # Step 1: get latest code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: configure AWS (using GitHub secrets)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1   # using Mumbai region
+
+      # Step 3: setup Node for frontend build
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # Step 4: install dependencies + build frontend
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ secrets.STAGING_API_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      # Step 5: upload frontend to S3
+      - name: Upload build to S3
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ secrets.STAGING_S3_BUCKET }} --delete \
+            --cache-control "public,max-age=31536000,immutable"
+
+          # index.html should not be cached
+          aws s3 cp frontend/dist/index.html \
+            s3://${{ secrets.STAGING_S3_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      # Step 6: clear CloudFront cache so new build reflects immediately
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.STAGING_CF_DIST_ID }} \
+            --paths "/*"
+
+      # Step 7: deploy backend to EC2
+      - name: Deploy backend (Django)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.STAGING_EC2_SSH_KEY }}
+          script: |
+            set -e   # stop if any command fails
+
+            cd /srv/symplichain
+
+            # pull latest code
+            git pull origin staging
+
+            # activate virtual env
+            source venv/bin/activate
+
+            # install/update dependencies
+            pip install -r requirements.txt -q
+
+            # apply DB migrations
+            python manage.py migrate --noinput
+
+            # collect static files
+            python manage.py collectstatic --noinput
+
+            # restart services
+            sudo systemctl restart gunicorn
+            sudo systemctl restart celery
+            sudo systemctl reload nginx
